@@ -1,0 +1,32 @@
+# =============================================================================
+# Dependencies for AI-Based Multi-Stage Phishing Investigation System
+#
+# NOTE: After installing these Python dependencies, install the Playwright
+# Chromium browser binary with:
+#     playwright install chromium
+# =============================================================================
+
+# Core Web Framework & Networking
+flask>=2.3.3,<3.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.2
+tldextract>=5.1.0
+
+# Browser Automation & Dynamic JavaScript Rendering
+playwright>=1.40.0
+
+# Machine Learning & Data Processing
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+joblib>=1.3.2
+pyarrow>=12.0.0
+
+# Configuration & Environment
+python-dotenv>=1.0.0
+
+# Optional Headless Visual Capture (src/screenshot.py)
+selenium>=4.15.0
+
+# Automated Testing
+pytest>=7.4.2

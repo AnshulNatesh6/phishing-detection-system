@@ -1,0 +1,87 @@
+# =============================================================================
+# Git Ignore Configuration: Phishing Detection & Investigation System
+# =============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments (do NOT commit virtual environments)
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables & Secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# IDE & Editor Specific
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+
+# Testing & Coverage Artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+.cache/
+nosetests.xml
+coverage.xml
+*.cover
+
+# Playwright Reports & Downloads
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# Packaging & Distribution
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Installer Logs & OS Specific
+pip-log.txt
+pip-delete-this-directory.txt
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary project scratch dumps
+project_structure.txt
+
+# Notebook checkpoints
+notebooks/.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Large / generated dataset caches (sample_urls.csv and baseline.joblib are preserved)
+data/*.tmp
+models/*.tmp
