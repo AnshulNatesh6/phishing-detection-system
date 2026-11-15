@@ -8,6 +8,7 @@ Does not execute JavaScript or submit forms.
 """
 
 import ipaddress
+import socket
 from urllib.parse import urljoin, urlparse
 import requests
 import tldextract
@@ -93,46 +94,133 @@ def get_registered_domain(hostname: str | None) -> str:
 
 
 def is_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """Check if an IP address belongs to private, loopback, link-local, or reserved ranges."""
-    return (
+    """Check if an IP address belongs to private, loopback, link-local, multicast, or reserved ranges."""
+    if (
         ip.is_private
         or ip.is_loopback
         or ip.is_link_local
         or ip.is_multicast
         or ip.is_reserved
         or ip.is_unspecified
-    )
+        or getattr(ip, "is_site_local", False)
+    ):
+        return True
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        return is_private_ip(ip.ipv4_mapped)
+    return False
 
 
 def is_private_or_local_host(hostname: str | None) -> bool:
     """
     Determine if a hostname or IP string refers to local, loopback, private,
     or internal network destinations to prevent SSRF attacks.
+    Handles standard hostnames, private TLDs/suffixes, IPv4/IPv6 literals,
+    dotted octal, abbreviated IPv4, integer DWORD, and hex formats.
     """
     if not hostname:
         return True
 
-    hostname = hostname.strip().lower()
+    clean = hostname.strip().lower()
 
-    if hostname.endswith("."):
-        hostname = hostname[:-1]
+    if clean.endswith("."):
+        clean = clean[:-1]
 
-    if hostname in PRIVATE_HOSTNAMES:
+    if clean in PRIVATE_HOSTNAMES:
         return True
 
-    if any(hostname.endswith(suffix) for suffix in PRIVATE_SUFFIXES):
+    if any(clean.endswith(suffix) for suffix in PRIVATE_SUFFIXES):
         return True
 
-    if hostname.startswith("[") and hostname.endswith("]"):
-        hostname = hostname[1:-1]
+    if clean.startswith("[") and clean.endswith("]"):
+        clean = clean[1:-1]
 
+    if "%" in clean:
+        clean = clean.split("%")[0]
+
+    # Standard IP address parsing (IPv4 and IPv6)
     try:
-        ip = ipaddress.ip_address(hostname)
+        ip = ipaddress.ip_address(clean)
         return is_private_ip(ip)
     except ValueError:
         pass
 
+    # Support dotted-octal and abbreviated IPv4 (e.g. 0177.0.0.1, 127.1)
+    try:
+        raw_bytes = socket.inet_aton(clean)
+        if clean.count(".") in (1, 2, 3) and not any(c.isalpha() for c in clean):
+            return is_private_ip(ipaddress.IPv4Address(raw_bytes))
+    except (OSError, ValueError):
+        pass
+
+    # Support integer DWORD IP representation (e.g. 2130706433 for 127.0.0.1)
+    if clean.isdigit():
+        try:
+            val = int(clean)
+            if 0 <= val <= 0xFFFFFFFF:
+                return is_private_ip(ipaddress.IPv4Address(val))
+        except ValueError:
+            pass
+
+    # Support hexadecimal IP representation (e.g. 0x7f000001)
+    if clean.startswith(("0x", "0X")):
+        try:
+            val = int(clean, 16)
+            if 0 <= val <= 0xFFFFFFFF:
+                return is_private_ip(ipaddress.IPv4Address(val))
+        except ValueError:
+            pass
+
     return False
+
+
+def is_safe_destination_host(hostname: str | None, allow_private_ips: bool = False) -> bool:
+    """
+    Validate that destination hostname does not refer to localhost,
+    private IPs, link-local, loopback, or internal networks.
+    Performs static pattern matching, IP literal parsing, and DNS resolution.
+    If ANY resolved IP is in private/loopback/reserved range, returns False.
+    """
+    if allow_private_ips:
+        return True
+    if not hostname:
+        return False
+
+    clean_host = hostname.strip().lower()
+    if clean_host.endswith("."):
+        clean_host = clean_host[:-1]
+
+    if clean_host.startswith("[") and clean_host.endswith("]"):
+        clean_host = clean_host[1:-1]
+
+    if "%" in clean_host:
+        clean_host = clean_host.split("%")[0]
+
+    if is_private_or_local_host(clean_host):
+        return False
+
+    # Perform DNS resolution to check for hostnames that resolve to private/local IPs
+    # (DNS rebinding / private resolution protection)
+    try:
+        addr_info = socket.getaddrinfo(clean_host, None)
+        for _, _, _, _, sockaddr in addr_info:
+            ip_str = sockaddr[0]
+            if ip_str.startswith("[") and ip_str.endswith("]"):
+                ip_str = ip_str[1:-1]
+            if "%" in ip_str:
+                ip_str = ip_str.split("%")[0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                if is_private_ip(ip):
+                    return False
+            except ValueError:
+                return False
+    except (socket.gaierror, socket.herror, OSError, ValueError):
+        # In offline/sandbox testing or for dummy test domains (e.g. .example),
+        # DNS resolution may fail. Non-resolvable hosts are permitted to continue
+        # to the HTTP request layer where network/mock handling occurs.
+        pass
+
+    return True
 
 
 def analyze_redirect_chain(
@@ -261,12 +349,12 @@ def analyze_redirect_chain(
         pass
 
     # Terminal HTTP error code check
-    if redirect_chain and redirect_chain[-1].get("status_code", 0) and redirect_chain[-1]["status_code"] >= 400:
-        term_code = redirect_chain[-1]["status_code"]
+    term_code = redirect_chain[-1].get("status_code") if redirect_chain else None
+    if isinstance(term_code, (int, float)) and term_code >= 400:
         findings.append({
             "type": "http_error_response",
-            "status_code": term_code,
-            "detail": f"Final destination returned HTTP error status {term_code}."
+            "status_code": int(term_code),
+            "detail": f"Final destination returned HTTP error status {int(term_code)}."
         })
 
     return {
@@ -388,8 +476,19 @@ def analyze_behaviour(
         parsed_current = urlparse(current_url)
         current_hostname = (parsed_current.hostname or "").lower()
 
-        # SSRF / Private address protection
-        if not allow_private_ips and is_private_or_local_host(current_hostname):
+        # Handle unbracketed IPv6 and raw IPs in netloc
+        netloc = parsed_current.netloc
+        if "@" in netloc:
+            netloc = netloc.split("@")[-1]
+        if "/" in netloc:
+            netloc = netloc.split("/")[0]
+        if is_private_or_local_host(netloc):
+            current_hostname = netloc.lower()
+        elif ":" in netloc and is_private_or_local_host(netloc.rsplit(":", 1)[0]):
+            current_hostname = netloc.rsplit(":", 1)[0].lower()
+
+        # SSRF / Private address protection (static patterns, IP literals, and DNS resolution)
+        if not allow_private_ips and not is_safe_destination_host(current_hostname, allow_private_ips=False):
             status = "blocked_private_address"
             error_detail = f"Access to private/local network address '{current_hostname}' was blocked."
             hop_info = {
@@ -467,6 +566,53 @@ def analyze_behaviour(
             next_url = urljoin(current_url, location_header.strip())
             hop_info["destination"] = next_url
             redirect_chain.append(hop_info)
+
+            # Validate next URL scheme
+            parsed_next = urlparse(next_url)
+            next_scheme = parsed_next.scheme.lower()
+            if next_scheme not in ("http", "https"):
+                status = "invalid_scheme"
+                error_detail = f"Redirect to unsupported scheme '{next_scheme}' was blocked."
+                redirect_chain.append({
+                    "hop": len(redirect_chain) + 1,
+                    "url": next_url,
+                    "status_code": None,
+                    "hostname": (parsed_next.hostname or "").lower(),
+                    "registered_domain": get_registered_domain(parsed_next.hostname),
+                    "destination": None,
+                    "blocked": True,
+                    "error": "invalid_scheme"
+                })
+                current_url = next_url
+                break
+
+            # Validate next URL destination host against private/local/SSRF targets before next request
+            next_hostname = (parsed_next.hostname or "").lower()
+            next_netloc = parsed_next.netloc
+            if "@" in next_netloc:
+                next_netloc = next_netloc.split("@")[-1]
+            if "/" in next_netloc:
+                next_netloc = next_netloc.split("/")[0]
+            if is_private_or_local_host(next_netloc):
+                next_hostname = next_netloc.lower()
+            elif ":" in next_netloc and is_private_or_local_host(next_netloc.rsplit(":", 1)[0]):
+                next_hostname = next_netloc.rsplit(":", 1)[0].lower()
+
+            if not allow_private_ips and not is_safe_destination_host(next_hostname, allow_private_ips=False):
+                status = "blocked_private_address"
+                error_detail = f"Access to private/local network address '{next_hostname}' was blocked."
+                redirect_chain.append({
+                    "hop": len(redirect_chain) + 1,
+                    "url": next_url,
+                    "status_code": None,
+                    "hostname": next_hostname,
+                    "registered_domain": get_registered_domain(next_hostname),
+                    "destination": None,
+                    "blocked": True
+                })
+                current_url = next_url
+                break
+
             current_url = next_url
         else:
             redirect_chain.append(hop_info)

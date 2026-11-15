@@ -5,7 +5,11 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from src.behaviour_agent import is_private_or_local_host, is_private_ip
+from src.behaviour_agent import (
+    is_private_or_local_host,
+    is_private_ip,
+    is_safe_destination_host
+)
 
 logger = logging.getLogger(__name__)
 
@@ -259,29 +263,96 @@ def analyze_webpage(html: str, page_url: str = "") -> dict:
     }
 
 
-def is_safe_destination_host(hostname: str | None, allow_private_ips: bool = False) -> bool:
+def _extract_dom_data_from_soup(soup: BeautifulSoup, page_url: str = "") -> dict:
     """
-    Validate that destination hostname does not refer to localhost,
-    private IPs, link-local, loopback, or internal networks.
+    Fallback extractor that parses live HTML using BeautifulSoup if browser evaluation fails
+    (e.g., if execution context is destroyed during in-flight navigation/redirect).
     """
-    if allow_private_ips:
-        return True
-    if not hostname:
-        return False
-    if is_private_or_local_host(hostname):
-        return False
-    try:
-        addr_info = socket.getaddrinfo(hostname, None)
-        for _, _, _, _, sockaddr in addr_info:
-            ip_str = sockaddr[0]
-            if ip_str.startswith("[") and ip_str.endswith("]"):
-                ip_str = ip_str[1:-1]
-            ip = ipaddress.ip_address(ip_str)
-            if is_private_ip(ip):
-                return False
-    except (socket.gaierror, socket.herror, OSError, ValueError):
-        pass
-    return True
+    base_tag = soup.find("base", href=True)
+    base_href = base_tag.get("href", "") if base_tag else ""
+    effective_base = urljoin(page_url, base_href) if base_href else page_url
+
+    title_tag = soup.find("title")
+    title = title_tag.get_text().strip() if title_tag else ""
+
+    forms_list = []
+    for idx, form in enumerate(soup.find_all("form")):
+        raw_action = form.get("action")
+        action = raw_action.strip() if isinstance(raw_action, str) else ""
+        resolved_action = urljoin(effective_base, action) if action else ""
+        method = (form.get("method") or "get").lower()
+        inputs = form.find_all("input")
+        passwords = [i for i in inputs if (i.get("type") or "text").lower() == "password"]
+        hiddens = [i for i in inputs if (i.get("type") or "").lower() == "hidden"]
+        forms_list.append({
+            "index": idx,
+            "raw_action": raw_action,
+            "resolved_action": resolved_action,
+            "method": method,
+            "passwords_count": len(passwords),
+            "hiddens_count": len(hiddens),
+        })
+
+    all_inputs = soup.find_all("input")
+    password_inputs = []
+    for i in all_inputs:
+        if (i.get("type") or "text").lower() == "password":
+            parent_form = i.find_parent("form")
+            form_action = parent_form.get("action") if parent_form else None
+            password_inputs.append({
+                "name": i.get("name") or "",
+                "id": i.get("id") or "",
+                "form_action": form_action,
+            })
+
+    hidden_inputs = []
+    for i in all_inputs:
+        if (i.get("type") or "").lower() == "hidden":
+            hidden_inputs.append({
+                "name": i.get("name") or "",
+                "id": i.get("id") or "",
+                "value": (i.get("value") or "")[:50],
+            })
+
+    iframes = []
+    for f in soup.find_all("iframe"):
+        raw_src = f.get("src")
+        resolved_src = urljoin(effective_base, raw_src.strip()) if raw_src else ""
+        iframes.append({
+            "raw_src": raw_src,
+            "resolved_src": resolved_src,
+        })
+
+    scripts = []
+    for s in soup.find_all("script"):
+        raw_src = s.get("src")
+        resolved_src = urljoin(effective_base, raw_src.strip()) if raw_src else ""
+        scripts.append({
+            "raw_src": raw_src,
+            "resolved_src": resolved_src,
+            "is_inline": not bool(raw_src),
+        })
+
+    links = []
+    for a in soup.find_all("a", href=True):
+        raw_href = a.get("href")
+        resolved_href = urljoin(effective_base, raw_href.strip()) if raw_href else ""
+        links.append({
+            "raw_href": raw_href,
+            "resolved_href": resolved_href,
+            "text": a.get_text().strip()[:100],
+        })
+
+    return {
+        "title": title,
+        "base_href": base_href,
+        "forms": forms_list,
+        "password_inputs": password_inputs,
+        "hidden_inputs": hidden_inputs,
+        "iframes": iframes,
+        "scripts": scripts,
+        "links": links,
+    }
 
 
 def analyze_rendered_webpage(
@@ -375,6 +446,16 @@ def analyze_rendered_webpage(
             }
 
         url_host = parsed_url.hostname
+        netloc = parsed_url.netloc
+        if "@" in netloc:
+            netloc = netloc.split("@")[-1]
+        if "/" in netloc:
+            netloc = netloc.split("/")[0]
+        if is_private_or_local_host(netloc):
+            url_host = netloc.lower()
+        elif ":" in netloc and is_private_or_local_host(netloc.rsplit(":", 1)[0]):
+            url_host = netloc.rsplit(":", 1)[0].lower()
+
         if not allow_private_ips and not is_safe_destination_host(url_host, allow_private_ips=False):
             return {
                 "agent": "Webpage Analysis Agent",
@@ -500,6 +581,11 @@ def analyze_rendered_webpage(
                     page.wait_for_timeout(settle_delay_ms)
             elif url:
                 page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+                # Allow page navigation/redirects to reach a stable state
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=min(timeout_ms, 3000))
+                except Exception:
+                    pass
                 if settle_delay_ms > 0:
                     page.wait_for_timeout(settle_delay_ms)
         except PlaywrightTimeoutError:
@@ -583,16 +669,170 @@ def analyze_rendered_webpage(
                 "note": "These are investigation indicators, not proof of phishing. External resources and hidden fields can be legitimate."
             }
 
-        if unsafe_redirect_state["blocked"]:
-            blocked_dest = unsafe_redirect_state["url"] or url
+        # Retry loop for HTML and DOM extraction to handle in-flight navigations/redirects
+        rendered_html = None
+        dom_data = None
+        page_title = ""
+        max_extract_retries = 3
+        last_extract_err = None
+
+        for attempt in range(max_extract_retries):
+            # Check if an unsafe redirect occurred during in-flight navigation
+            if unsafe_redirect_state["blocked"]:
+                blocked_dest = unsafe_redirect_state["url"] or url
+                return {
+                    "agent": "Webpage Analysis Agent",
+                    "rendering": "playwright",
+                    "page_url": url,
+                    "final_url": blocked_dest,
+                    "title": "",
+                    "status": "blocked_private_address",
+                    "error_detail": f"Navigation redirected to blocked private address '{blocked_dest}'.",
+                    "forms_count": 0,
+                    "password_fields_count": 0,
+                    "hidden_fields_count": 0,
+                    "iframes_count": 0,
+                    "scripts_count": 0,
+                    "external_scripts_count": 0,
+                    "external_links_count": 0,
+                    "suspicious_form_actions": [],
+                    "missing_form_actions": [],
+                    "credential_forms": [],
+                    "findings": [{
+                        "type": "blocked_private_address",
+                        "detail": f"Navigation redirected to private/local address '{blocked_dest}' and was blocked.",
+                        "url": blocked_dest
+                    }],
+                    "note": "These are investigation indicators, not proof of phishing. External resources and hidden fields can be legitimate."
+                }
+
+            final_url = page.url or url
+            if final_url == "about:blank":
+                final_url = url
+
+            try:
+                try:
+                    page_title = page.title()
+                except Exception:
+                    page_title = ""
+
+                rendered_html = page.content()
+
+                # Attempt live DOM evaluation
+                try:
+                    dom_data = page.evaluate("""() => {
+                        const forms = Array.from(document.querySelectorAll('form')).map((form, idx) => {
+                            const rawAction = form.getAttribute('action');
+                            const actionProp = form.action || '';
+                            const method = (form.getAttribute('method') || form.method || 'get').toLowerCase();
+                            const inputs = Array.from(form.querySelectorAll('input'));
+                            const passwords = inputs.filter(i => (i.type || '').toLowerCase() === 'password');
+                            const hiddens = inputs.filter(i => (i.type || '').toLowerCase() === 'hidden');
+                            return {
+                                index: idx,
+                                raw_action: rawAction,
+                                resolved_action: actionProp,
+                                method: method,
+                                passwords_count: passwords.length,
+                                hiddens_count: hiddens.length
+                            };
+                        });
+
+                        const passwordInputs = Array.from(document.querySelectorAll('input')).filter(
+                            i => (i.type || '').toLowerCase() === 'password'
+                        ).map(i => ({
+                            name: i.name || '',
+                            id: i.id || '',
+                            form_action: i.form ? (i.form.getAttribute('action') || '') : null
+                        }));
+
+                        const hiddenInputs = Array.from(document.querySelectorAll('input')).filter(
+                            i => (i.type || '').toLowerCase() === 'hidden'
+                        ).map(i => ({
+                            name: i.name || '',
+                            id: i.id || '',
+                            value: (i.value || '').substring(0, 50)
+                        }));
+
+                        const iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
+                            raw_src: f.getAttribute('src'),
+                            resolved_src: f.src || ''
+                        }));
+
+                        const scripts = Array.from(document.querySelectorAll('script')).map(s => ({
+                            raw_src: s.getAttribute('src'),
+                            resolved_src: s.src || '',
+                            is_inline: !s.src
+                        }));
+
+                        const links = Array.from(document.querySelectorAll('a[href]')).map(a => ({
+                            raw_href: a.getAttribute('href'),
+                            resolved_href: a.href || '',
+                            text: (a.textContent || '').trim().substring(0, 100)
+                        }));
+
+                        const baseTag = document.querySelector('base[href]');
+                        const baseHref = baseTag ? baseTag.getAttribute('href') : '';
+
+                        return {
+                            title: document.title,
+                            base_href: baseHref,
+                            forms,
+                            password_inputs: passwordInputs,
+                            hidden_inputs: hiddenInputs,
+                            iframes,
+                            scripts,
+                            links
+                        };
+                    }""")
+                except Exception:
+                    # Live evaluation failed (e.g. execution context destroyed); parse rendered HTML with BeautifulSoup
+                    soup = BeautifulSoup(rendered_html, "html.parser")
+                    dom_data = _extract_dom_data_from_soup(soup, final_url)
+                    if not page_title:
+                        page_title = dom_data.get("title", "")
+
+                # Successfully retrieved HTML and DOM data
+                break
+
+            except Exception as e:
+                last_extract_err = e
+                err_msg = str(e).lower()
+                is_nav_err = (
+                    "navigating" in err_msg
+                    or "context was destroyed" in err_msg
+                    or "execution context" in err_msg
+                    or "target closed" in err_msg
+                )
+                if is_nav_err and attempt < max_extract_retries - 1:
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=2000)
+                    except Exception:
+                        pass
+                    try:
+                        page.wait_for_timeout(500 * (attempt + 1))
+                    except Exception:
+                        pass
+                    continue
+                else:
+                    break
+
+        if rendered_html is None or dom_data is None:
+            final_url = page.url or url
+            if final_url == "about:blank":
+                final_url = url
+            try:
+                context.close()
+            except Exception:
+                pass
             return {
                 "agent": "Webpage Analysis Agent",
                 "rendering": "playwright",
                 "page_url": url,
-                "final_url": blocked_dest,
-                "title": "",
-                "status": "blocked_private_address",
-                "error_detail": f"Navigation redirected to blocked private address '{blocked_dest}'.",
+                "final_url": final_url,
+                "title": page_title or "",
+                "status": "extraction_error",
+                "error_detail": f"Failed to retrieve page content after retries: {last_extract_err}",
                 "forms_count": 0,
                 "password_fields_count": 0,
                 "hidden_fields_count": 0,
@@ -604,87 +844,17 @@ def analyze_rendered_webpage(
                 "missing_form_actions": [],
                 "credential_forms": [],
                 "findings": [{
-                    "type": "blocked_private_address",
-                    "detail": f"Navigation redirected to private/local address '{blocked_dest}' and was blocked.",
-                    "url": blocked_dest
+                    "type": "extraction_error",
+                    "detail": f"Page content could not be extracted: {last_extract_err}",
+                    "url": final_url
                 }],
                 "note": "These are investigation indicators, not proof of phishing. External resources and hidden fields can be legitimate."
             }
 
-        final_url = page.url or url
-        if final_url == "about:blank":
-            final_url = url
-        page_title = page.title()
-        rendered_html = page.content()
-
-        # Extract live DOM elements via browser evaluation
-        dom_data = page.evaluate("""() => {
-            const forms = Array.from(document.querySelectorAll('form')).map((form, idx) => {
-                const rawAction = form.getAttribute('action');
-                const actionProp = form.action || '';
-                const method = (form.getAttribute('method') || form.method || 'get').toLowerCase();
-                const inputs = Array.from(form.querySelectorAll('input'));
-                const passwords = inputs.filter(i => (i.type || '').toLowerCase() === 'password');
-                const hiddens = inputs.filter(i => (i.type || '').toLowerCase() === 'hidden');
-                return {
-                    index: idx,
-                    raw_action: rawAction,
-                    resolved_action: actionProp,
-                    method: method,
-                    passwords_count: passwords.length,
-                    hiddens_count: hiddens.length
-                };
-            });
-
-            const passwordInputs = Array.from(document.querySelectorAll('input')).filter(
-                i => (i.type || '').toLowerCase() === 'password'
-            ).map(i => ({
-                name: i.name || '',
-                id: i.id || '',
-                form_action: i.form ? (i.form.getAttribute('action') || '') : null
-            }));
-
-            const hiddenInputs = Array.from(document.querySelectorAll('input')).filter(
-                i => (i.type || '').toLowerCase() === 'hidden'
-            ).map(i => ({
-                name: i.name || '',
-                id: i.id || '',
-                value: (i.value || '').substring(0, 50)
-            }));
-
-            const iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
-                raw_src: f.getAttribute('src'),
-                resolved_src: f.src || ''
-            }));
-
-            const scripts = Array.from(document.querySelectorAll('script')).map(s => ({
-                raw_src: s.getAttribute('src'),
-                resolved_src: s.src || '',
-                is_inline: !s.src
-            }));
-
-            const links = Array.from(document.querySelectorAll('a[href]')).map(a => ({
-                raw_href: a.getAttribute('href'),
-                resolved_href: a.href || '',
-                text: (a.textContent || '').trim().substring(0, 100)
-            }));
-
-            const baseTag = document.querySelector('base[href]');
-            const baseHref = baseTag ? baseTag.getAttribute('href') : '';
-
-            return {
-                title: document.title,
-                base_href: baseHref,
-                forms,
-                password_inputs: passwordInputs,
-                hidden_inputs: hiddenInputs,
-                iframes,
-                scripts,
-                links
-            };
-        }""")
-
-        context.close()
+        try:
+            context.close()
+        except Exception:
+            pass
 
         # Process domain and base resolution
         base_href = dom_data.get("base_href", "")
@@ -892,9 +1062,15 @@ def analyze_rendered_webpage(
         }
     finally:
         if close_browser_when_done and browser is not None:
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
         if playwright_ctx is not None:
-            playwright_ctx.stop()
+            try:
+                playwright_ctx.stop()
+            except Exception:
+                pass
 
 
 # Alias for flexible importing
