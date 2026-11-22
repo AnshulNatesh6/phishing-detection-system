@@ -241,6 +241,59 @@ def test_navigation_timeout_handling():
     assert "timed out" in result["error_detail"]
 
 
+def test_navigation_timeout_recovery_with_rendered_dom():
+    """
+    Verify that if navigation encounters a timeout on deferred scripts/resources,
+    but the document DOM has loaded, the agent extracts the rendered DOM rather
+    than discarding the entire page.
+    """
+    from unittest.mock import MagicMock
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    mock_browser = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+
+    mock_browser.new_context.return_value = mock_context
+    mock_context.new_page.return_value = mock_page
+    # Navigation reached commit, but DOMContentLoaded timed out waiting for slow/deferred tracking resources
+    mock_page.goto.return_value = None
+    mock_page.wait_for_load_state.side_effect = PlaywrightTimeoutError("DOMContentLoaded timed out after 6000ms")
+    mock_page.url = "https://slow-resources.example/login"
+    mock_page.title.return_value = "Slow Portal"
+    mock_page.content.return_value = "<html><head><title>Slow Portal</title></head><body><form action='/login'><input type='password' name='pwd'></form><iframe id='editor'></iframe></body></html>"
+    mock_page.evaluate.return_value = {
+        "title": "Slow Portal",
+        "base_href": "",
+        "forms": [{
+            "index": 0,
+            "raw_action": "/login",
+            "resolved_action": "https://slow-resources.example/login",
+            "method": "get",
+            "passwords_count": 1,
+            "hiddens_count": 0
+        }],
+        "password_inputs": [{"name": "pwd", "id": "", "form_action": "/login"}],
+        "hidden_inputs": [],
+        "iframes": [{"raw_src": None, "resolved_src": "", "name": "editor", "id": "editor"}],
+        "scripts": [],
+        "links": []
+    }
+    mock_page.frames = [mock_page]
+
+    result = analyze_rendered_webpage(
+        url="https://slow-resources.example/login",
+        timeout=15.0,
+        browser=mock_browser
+    )
+
+    assert result["status"] == "completed"
+    assert result["forms_count"] == 1
+    assert result["password_fields_count"] == 1
+    assert result["iframes_count"] == 1
+    assert result["title"] == "Slow Portal"
+
+
 def test_connection_error_handling():
     """
     Verify that unexpected connection/browser errors are handled gracefully.
@@ -349,3 +402,72 @@ def test_schema_compatibility_with_correlation_agent():
     assert report["risk_score"] > 0
     assert report["agent_results"]["webpage_analysis"] is not None
     assert report["agent_results"]["webpage_analysis"]["rendering"] == "playwright"
+
+
+def test_tinymce_style_editor_iframe_detection():
+    """
+    Verify detection of TinyMCE-style editor iframes: dynamically created inside
+    an editor container (.tox-edit-area__iframe) without external src attributes.
+    Must detect iframes_count == 1 and not misclassify as external.
+    """
+    tinymce_html = """
+    <!DOCTYPE html>
+    <html>
+    <head><title>Editor Portal</title></head>
+    <body>
+        <div class="example">
+            <h3>WYSIWYG Editor</h3>
+            <textarea id="mce_0">Default content</textarea>
+        </div>
+        <script>
+            // Simulate TinyMCE asynchronous editor injection
+            setTimeout(() => {
+                const tox = document.createElement("div");
+                tox.className = "tox tox-tinymce";
+                const editArea = document.createElement("div");
+                editArea.className = "tox-edit-area";
+                const ifr = document.createElement("iframe");
+                ifr.id = "mce_0_ifr";
+                ifr.className = "tox-edit-area__iframe";
+                ifr.title = "Rich Text Area";
+                editArea.appendChild(ifr);
+                tox.appendChild(editArea);
+                document.querySelector(".example").appendChild(tox);
+            }, 30);
+        </script>
+    </body>
+    </html>
+    """
+    result = analyze_rendered_webpage(
+        html=tinymce_html,
+        url="https://portal.example/compose"
+    )
+
+    assert result["status"] == "completed"
+    assert result["iframes_count"] == 1
+    # Editor iframes without external src must not be flagged as external_iframes
+    assert not any(f["type"] == "external_iframes" for f in result["findings"])
+
+
+def test_dynamic_iframe_with_empty_and_missing_src():
+    """
+    Verify detection of dynamically inserted iframes with missing or empty src attributes.
+    """
+    dynamic_html = """
+    <html><body>
+        <div id="target"></div>
+        <script>
+            const f1 = document.createElement("iframe");
+            f1.id = "frame_no_src";
+            const f2 = document.createElement("iframe");
+            f2.id = "frame_empty_src";
+            f2.src = "";
+            document.getElementById("target").appendChild(f1);
+            document.getElementById("target").appendChild(f2);
+        </script>
+    </body></html>
+    """
+    result = analyze_rendered_webpage(html=dynamic_html, url="https://app.example/dash")
+
+    assert result["status"] == "completed"
+    assert result["iframes_count"] == 2

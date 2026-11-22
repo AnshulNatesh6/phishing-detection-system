@@ -1,6 +1,7 @@
 import ipaddress
 import logging
 import socket
+import time
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -321,6 +322,8 @@ def _extract_dom_data_from_soup(soup: BeautifulSoup, page_url: str = "") -> dict
         iframes.append({
             "raw_src": raw_src,
             "resolved_src": resolved_src,
+            "name": f.get("name") or f.get("id") or "",
+            "id": f.get("id") or "",
         })
 
     scripts = []
@@ -542,6 +545,17 @@ def analyze_rendered_webpage(
 
         blocked_subresources = []
         unsafe_redirect_state = {"blocked": False, "url": None}
+        safe_host_cache = {}
+
+        def is_safe_subresource_host(host_str: str | None) -> bool:
+            if not host_str:
+                return False
+            h_clean = host_str.strip().lower()
+            if h_clean in safe_host_cache:
+                return safe_host_cache[h_clean]
+            res = is_safe_destination_host(h_clean, allow_private_ips=allow_private_ips)
+            safe_host_cache[h_clean] = res
+            return res
 
         def handle_route(route):
             req = route.request
@@ -557,7 +571,7 @@ def analyze_rendered_webpage(
                 route.abort("accessdenied")
                 return
 
-            if not allow_private_ips and not is_safe_destination_host(host, allow_private_ips=False):
+            if not allow_private_ips and not is_safe_subresource_host(host):
                 if req.frame == page.main_frame and req.is_navigation_request():
                     unsafe_redirect_state["blocked"] = True
                     unsafe_redirect_state["url"] = req_url
@@ -574,20 +588,57 @@ def analyze_rendered_webpage(
 
         page.route("**/*", handle_route)
 
+        start_time = time.time()
+
+        def remaining_timeout_ms() -> int:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            return max(0, timeout_ms - elapsed_ms)
+
         try:
             if html is not None:
-                page.set_content(html, timeout=timeout_ms, wait_until=wait_until)
-                if settle_delay_ms > 0:
-                    page.wait_for_timeout(settle_delay_ms)
+                page.set_content(html, timeout=remaining_timeout_ms(), wait_until=wait_until)
+                if not any(f != page.main_frame for f in page.frames):
+                    try:
+                        rem_ms = remaining_timeout_ms()
+                        if rem_ms > 300 and page.locator("textarea, .tox, .mce-tinymce, [data-editor]").count() > 0:
+                            page.wait_for_selector("iframe", state="attached", timeout=min(rem_ms, 4500))
+                    except Exception:
+                        pass
+                settle_ms = min(settle_delay_ms, remaining_timeout_ms())
+                if settle_ms > 0:
+                    page.wait_for_timeout(settle_ms)
             elif url:
-                page.goto(url, timeout=timeout_ms, wait_until=wait_until)
-                # Allow page navigation/redirects to reach a stable state
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=min(timeout_ms, 3000))
-                except Exception:
-                    pass
-                if settle_delay_ms > 0:
-                    page.wait_for_timeout(settle_delay_ms)
+                # 1. Navigation commit: Ensure HTTP headers and body response have arrived.
+                # Avoid monolithic wait on 'load' or 'networkidle' which waits for dead analytics,
+                # fonts, or all external assets. If the server does not respond within the budget,
+                # goto raises PlaywrightTimeoutError and correctly reports a timeout.
+                page.goto(url, timeout=remaining_timeout_ms(), wait_until="commit")
+
+                # 2. Bounded wait for DOMContentLoaded: Allows HTML parsing and scripts to run
+                # without stalling indefinitely on slow or failing third-party analytics/trackers.
+                rem_ms = remaining_timeout_ms()
+                if rem_ms > 200 and wait_until != "commit":
+                    try:
+                        dcl_budget = min(rem_ms, 6000)
+                        page.wait_for_load_state("domcontentloaded", timeout=dcl_budget)
+                    except PlaywrightTimeoutError:
+                        # Document reached commit; proceed to DOM extraction even if slow
+                        # external subresources delayed the DOMContentLoaded event
+                        pass
+
+                # 3. Bounded wait for dynamic editor containers (TinyMCE, WYSIWYG iframes)
+                if not any(f != page.main_frame for f in page.frames):
+                    try:
+                        rem_ms = remaining_timeout_ms()
+                        if rem_ms > 300 and page.locator("textarea, .tox, .mce-tinymce, [data-editor]").count() > 0:
+                            page.wait_for_selector("iframe", state="attached", timeout=min(rem_ms, 4500))
+                    except Exception:
+                        pass
+
+                # 4. Bounded settle delay for dynamic scripts
+                settle_ms = min(settle_delay_ms, remaining_timeout_ms())
+                if settle_ms > 0:
+                    page.wait_for_timeout(settle_ms)
         except PlaywrightTimeoutError:
             return {
                 "agent": "Webpage Analysis Agent",
@@ -756,7 +807,9 @@ def analyze_rendered_webpage(
 
                         const iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
                             raw_src: f.getAttribute('src'),
-                            resolved_src: f.src || ''
+                            resolved_src: f.src || '',
+                            name: f.getAttribute('name') || f.id || '',
+                            id: f.id || ''
                         }));
 
                         const scripts = Array.from(document.querySelectorAll('script')).map(s => ({
@@ -850,6 +903,33 @@ def analyze_rendered_webpage(
                 }],
                 "note": "These are investigation indicators, not proof of phishing. External resources and hidden fields can be legitimate."
             }
+
+        # Reconcile iframes from DOM query and Playwright frame tree
+        # to ensure dynamic, cross-origin, or editor iframes are never missed
+        try:
+            dom_iframes = dom_data.get("iframes", [])
+            child_frames = [f for f in page.frames if f != page.main_frame]
+            if len(dom_iframes) < len(child_frames):
+                existing_names = {ifr.get("name") or ifr.get("id") for ifr in dom_iframes if ifr.get("name") or ifr.get("id")}
+                existing_srcs = {ifr.get("resolved_src") or ifr.get("raw_src") for ifr in dom_iframes if ifr.get("resolved_src") or ifr.get("raw_src")}
+                for cf in child_frames:
+                    cf_name = cf.name or ""
+                    cf_url = cf.url if cf.url and cf.url not in ("about:blank", "about:srcdoc") else ""
+                    if (cf_name and cf_name in existing_names) or (cf_url and cf_url in existing_srcs):
+                        continue
+                    dom_iframes.append({
+                        "raw_src": cf_url or None,
+                        "resolved_src": cf_url or "",
+                        "name": cf_name,
+                        "id": cf_name
+                    })
+                    if cf_name:
+                        existing_names.add(cf_name)
+                    if cf_url:
+                        existing_srcs.add(cf_url)
+                dom_data["iframes"] = dom_iframes
+        except Exception:
+            pass
 
         try:
             context.close()

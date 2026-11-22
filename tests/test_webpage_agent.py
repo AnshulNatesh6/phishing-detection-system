@@ -285,3 +285,24 @@ def test_indicators_not_treated_alone_as_phishing():
     assert result["suspicious_form_actions"] == []
     # Note must clearly state these are investigation indicators
     assert "These are investigation indicators, not proof of phishing" in result["note"]
+
+
+def test_iframe_missing_and_empty_src_detection():
+    """
+    Verify that iframes with missing or empty src attributes (like editor frames)
+    are counted in iframes_count and not misclassified as external.
+    """
+    html = """
+    <html><body>
+        <iframe id="mce_0_ifr" class="tox-edit-area__iframe"></iframe>
+        <iframe src=""></iframe>
+        <iframe src="https://other.example/embed"></iframe>
+    </body></html>
+    """
+    result = analyze_webpage(html, "https://example.com/editor")
+    assert result["iframes_count"] == 3
+    # Only the external iframe should be in external_iframes
+    ext_iframe_finding = next((f for f in result["findings"] if f["type"] == "external_iframes"), None)
+    assert ext_iframe_finding is not None
+    assert ext_iframe_finding["count"] == 1
+    assert "https://other.example/embed" in ext_iframe_finding["items"]

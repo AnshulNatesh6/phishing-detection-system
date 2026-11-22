@@ -24,13 +24,14 @@ def test_load_data(tmp_path):
 
 @patch('src.data_processing.load_data')
 @patch('src.features.extract_features')
-def test_process_data(mock_extract, mock_load):
+def test_process_data(mock_extract, mock_load, tmp_path):
     """Test processing."""
     mock_df = pd.DataFrame({'url': ['https://example.com'], 'label': [0]})
     mock_load.return_value = mock_df
     mock_extract.return_value = [1.0] * 10
     
-    with patch('src.config.PROCESSED_PARQUET', '/tmp/test.parquet'):
+    out_parquet = tmp_path / "test.parquet"
+    with patch('src.data_processing.PROCESSED_PARQUET', str(out_parquet)):
         df = process_data()
         assert len(df) == 1
         assert 'feature_1' in df.columns
