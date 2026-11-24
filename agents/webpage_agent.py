@@ -6,11 +6,18 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from src.behaviour_agent import (
-    is_private_or_local_host,
-    is_private_ip,
-    is_safe_destination_host
-)
+try:
+    from agents.behaviour_agent import (
+        is_private_or_local_host,
+        is_private_ip,
+        is_safe_destination_host
+    )
+except ImportError:
+    from behaviour_agent import (
+        is_private_or_local_host,
+        is_private_ip,
+        is_safe_destination_host
+    )
 
 logger = logging.getLogger(__name__)
 

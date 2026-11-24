@@ -21,20 +21,33 @@ import re
 import sys
 from urllib.parse import urlparse
 
-# Ensure project root is on sys.path for direct script execution
-PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# Ensure project root and agents directory are on sys.path for direct script execution
+AGENTS_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = AGENTS_DIR.parent
+for p in (str(PROJECT_ROOT), str(AGENTS_DIR)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-from src.behaviour_agent import (
-    analyze_behaviour,
-    is_private_or_local_host,
-    is_private_ip
-)
-from src.webpage_agent import (
-    analyze_rendered_webpage,
-    is_safe_destination_host
-)
+try:
+    from agents.behaviour_agent import (
+        analyze_behaviour,
+        is_private_or_local_host,
+        is_private_ip
+    )
+    from agents.webpage_agent import (
+        analyze_rendered_webpage,
+        is_safe_destination_host
+    )
+except ImportError:
+    from behaviour_agent import (
+        analyze_behaviour,
+        is_private_or_local_host,
+        is_private_ip
+    )
+    from webpage_agent import (
+        analyze_rendered_webpage,
+        is_safe_destination_host
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -474,8 +487,18 @@ test_url.__test__ = False
 
 def main() -> None:
     """
-    Main terminal interactive loop for testing both phishing analysis agents.
+    Main terminal runner / interactive loop for testing both phishing analysis agents.
     """
+    # If a URL is provided directly as a command-line argument:
+    if len(sys.argv) > 1 and sys.argv[1].strip() not in ("-h", "--help"):
+        raw_url = sys.argv[1].strip()
+        target_url, err = normalize_and_validate_url(raw_url)
+        if err:
+            print(f"[!] {err}\n")
+            sys.exit(1)
+        test_url(target_url)
+        return
+
     print("========== PHISHING AGENT TESTER ==========\n")
 
     while True:
